@@ -2,23 +2,31 @@ import sys
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QEvent, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
+from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QScrollArea, QSplitter, QWidget,
+    QMainWindow, QMessageBox, QScrollArea, QSplitter, QToolBar, QWidget,
 )
 
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.25, 5.0
 THUMB_ZOOM = 0.2
 GAP = 8  # px around pages
+MATCH, CURRENT_MATCH = QColor(255, 220, 0, 90), QColor(255, 120, 0, 130)
 
 
-def render(page, zoom, dpr=1.0):
+def render(page, zoom, dpr=1.0, marks=(), current=None):
+    """Page as a QPixmap, with search matches (page-space rects) painted over it."""
     pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom * dpr, zoom * dpr), alpha=False)
     img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()  # copy: samples die with pix
     pm = QPixmap.fromImage(img)
     pm.setDevicePixelRatio(dpr)  # sharp text on 125%/150% Windows scaling
+    if marks:
+        painter = QPainter(pm)
+        for r in marks:
+            painter.fillRect(QRectF(r.x0 * zoom, r.y0 * zoom, r.width * zoom, r.height * zoom),
+                             CURRENT_MATCH if r == current else MATCH)
+        painter.end()
     return pm
 
 
@@ -28,6 +36,8 @@ class Viewer(QMainWindow):
         self.setWindowTitle("PDF Reader")
         self.resize(1100, 800)
         self.doc, self.zoom, self.labels = None, 1.0, []
+        self.query, self.matches, self.match = None, [], -1  # matches: [(page index, rect)]
+        self.marks = {}  # page index -> rects, for painting
 
         self.thumbs = QListWidget()
         self.thumbs.setAccessibleName("Page thumbnails")
@@ -45,6 +55,23 @@ class Viewer(QMainWindow):
         # Scanned pages take ~0.3s each: render once scrolling pauses, not on every scroll tick.
         self.render_timer = QTimer(self, singleShot=True, interval=60, timeout=self.render_visible)
 
+        self.find_box = QLineEdit(placeholderText="Find in document", clearButtonEnabled=True)
+        self.find_box.setAccessibleName("Find in document")
+        self.find_box.setMaximumWidth(300)
+        self.find_box.returnPressed.connect(self.find_next)
+        self.find_box.installEventFilter(self)  # Shift+Enter = previous
+        self.find_count = QLabel()
+        self.find_bar = QToolBar("Find", movable=False, visible=False)
+        self.find_bar.addWidget(self.find_box)
+        self.find_bar.addAction("Previous", self.find_prev).setToolTip("Previous match (Shift+F3)")
+        self.find_bar.addAction("Next", self.find_next).setToolTip("Next match (F3)")
+        self.find_bar.addWidget(self.find_count)
+        close = self.find_bar.addAction("\u2715", self.close_find)
+        close.setToolTip("Close (Esc)")
+        close.setShortcut(Qt.Key_Escape)
+        close.setShortcutContext(Qt.WidgetWithChildrenShortcut)  # Esc only while the find bar has focus
+        self.addToolBar(self.find_bar)
+
         split = QSplitter()
         split.addWidget(self.thumbs)
         split.addWidget(self.scroll)
@@ -53,6 +80,9 @@ class Viewer(QMainWindow):
 
         for menu_name, items in {
             "&File": [("&Open…", QKeySequence.Open, self.open_dialog), ("&Quit", QKeySequence.Quit, self.close)],
+            "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
+                      ("Find &Next", QKeySequence.FindNext, self.find_next),
+                      ("Find &Previous", QKeySequence.FindPrevious, self.find_prev)],
             "&View": [("Zoom &In", QKeySequence.ZoomIn, lambda: self.set_zoom(self.zoom * ZOOM_STEP)),
                       ("Zoom &Out", QKeySequence.ZoomOut, lambda: self.set_zoom(self.zoom / ZOOM_STEP)),
                       ("&Actual Size", "Ctrl+0", lambda: self.set_zoom(1.0))],
@@ -82,6 +112,8 @@ class Viewer(QMainWindow):
             QMessageBox.critical(self, "Cannot open file", f"{path}\n\n{e}")
             return False
         self.doc = doc
+        self.query, self.matches, self.match, self.marks = None, [], -1, {}
+        self.find_count.clear()
         self.setWindowTitle(f"{Path(path).name} — PDF Reader")
         self.thumbs.clear()
         blank = QPixmap(self.thumbs.iconSize())
@@ -148,6 +180,10 @@ class Viewer(QMainWindow):
         if event.type() == QEvent.Resize:
             self.place_pages()
             self.schedule_render()
+        elif (obj is self.find_box and event.type() == QEvent.KeyPress
+              and event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ShiftModifier):
+            self.find_prev()
+            return True
         elif event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
             # 120 = one mouse-wheel notch; touchpads send smaller steps
             self.set_zoom(self.zoom * ZOOM_STEP ** (event.angleDelta().y() / 120), event.position().y())
@@ -192,16 +228,80 @@ class Viewer(QMainWindow):
         kind, i = todo[0]
         dpr = self.devicePixelRatioF()
         if kind == "page":
-            self.labels[i].setPixmap(render(self.doc[i], self.zoom, dpr))
+            current = self.matches[self.match][1] if self.match >= 0 else None
+            self.labels[i].setPixmap(render(self.doc[i], self.zoom, dpr, self.marks.get(i, ()), current))
             self.labels[i].rendered = True
         else:
             self.thumbs.item(i).setIcon(QIcon(render(self.doc[i], THUMB_ZOOM, dpr)))
             self.thumbs.item(i).setData(Qt.UserRole, True)  # thumbnails are small: keep them once drawn
         QTimer.singleShot(1, self.render_visible)  # 1ms, not 0: lets timers and input run in between
 
+    def open_find(self):
+        self.find_bar.show()
+        self.find_box.setFocus()
+        self.find_box.selectAll()
+
+    def close_find(self):
+        self.find_bar.hide()
+        self.find_box.clear()
+        self.search("")
+        self.scroll.setFocus()
+
+    def search(self, text):
+        self.query, self.matches, self.match = text, [], -1
+        if text and self.doc:
+            QApplication.setOverrideCursor(Qt.WaitCursor)  # ~1s for a 572-page book
+            try:
+                for i, page in enumerate(self.doc):
+                    self.matches += [(i, r * page.rotation_matrix) for r in page.search_for(text)]
+            finally:
+                QApplication.restoreOverrideCursor()
+        self.marks = {}
+        for i, r in self.matches:
+            self.marks.setdefault(i, []).append(r)
+        if self.matches:  # start from the page being read, like other viewers
+            start = self.current_page()
+            self.match = next((k for k, (i, _) in enumerate(self.matches) if i >= start), 0)
+        self.show_match()
+
+    def find_next(self):
+        self.step_match(1)
+
+    def find_prev(self):
+        self.step_match(-1)
+
+    def step_match(self, step):
+        text = self.find_box.text()
+        if not self.find_bar.isVisible() or text != self.query:
+            self.find_bar.show()
+            return self.search(text)
+        if self.matches:
+            self.match = (self.match + step) % len(self.matches)
+        self.show_match()
+
+    def show_match(self):
+        if self.matches:
+            self.find_count.setText(f"  {self.match + 1} of {len(self.matches)}  ")
+        else:
+            self.find_count.setText("  No results  " if self.query else "")
+        for label in self.labels:  # repaint highlights (only on-screen pages are drawn anyway)
+            label.clear()
+            label.rendered = False
+        if self.matches:
+            i, r = self.matches[self.match]
+            label = self.labels[i]
+            # scroll only if the match is off-screen, then leave it a third of the way down
+            self.scroll.ensureVisible(round(label.x() + r.x0 * self.zoom), round(label.y() + r.y0 * self.zoom),
+                                      50, self.scroll.viewport().height() // 3)
+        self.render_visible()
+
     def follow_in_sidebar(self):
         """Highlight the current page's thumbnail and scroll it into view, without jumping the document."""
-        page = self.current_page()
+        top = self.scroll.verticalScrollBar().value()
+        bottom = top + self.scroll.viewport().height()
+        # the page filling most of the view, not a sliver left at the top; ties go to the earlier page
+        shown = [min(bottom, l.y() + l.height()) - max(top, l.y()) for l in self.labels]
+        page = shown.index(max(shown)) if shown else 0
         if self.labels and self.thumbs.currentRow() != page:
             self.thumbs.blockSignals(True)  # else currentRowChanged -> go_to snaps the view to the page top
             self.thumbs.setCurrentRow(page)

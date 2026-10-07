@@ -158,3 +158,68 @@ def test_sidebar_follows_scrolled_page(viewer, pdf, qtbot):
     assert bar.value() == target, "highlighting the thumbnail must not snap the document"
     item_rect = viewer.thumbs.visualItemRect(viewer.thumbs.item(15))
     assert viewer.thumbs.viewport().rect().intersects(item_rect), "current thumbnail scrolled into view"
+
+
+def find(viewer, qtbot, text):
+    viewer.open_find()
+    viewer.find_box.setText(text)
+    qtbot.keyClick(viewer.find_box, Qt.Key_Return)
+
+
+def test_ctrl_f_opens_find_bar(viewer, pdf):
+    viewer.open(str(pdf))
+    [action] = [a for a in viewer.findChildren(QAction) if a.text() == "&Find…"]
+    action.trigger()
+    assert viewer.find_bar.isVisible()
+
+
+def test_search_counts_and_steps_through_matches(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    find(viewer, qtbot, "Page 2")  # pages 2 and 20-29 contain it
+    assert len(viewer.matches) == 11
+    assert viewer.find_count.text().strip() == "1 of 11"
+    qtbot.keyClick(viewer.find_box, Qt.Key_Return)
+    assert viewer.matches[viewer.match][0] == 19, "Enter goes to the next match (page 20)"
+    i, r = viewer.matches[viewer.match]
+    top = viewer.scroll.verticalScrollBar().value()
+    assert top < viewer.labels[i].y() + r.y0 < top + viewer.scroll.viewport().height(), "match scrolled into view"
+    qtbot.keyClick(viewer.find_box, Qt.Key_Return, Qt.ShiftModifier)
+    qtbot.keyClick(viewer.find_box, Qt.Key_Return, Qt.ShiftModifier)
+    assert viewer.find_count.text().strip() == "11 of 11", "Shift+Enter goes back and wraps"
+
+
+def test_search_starts_from_current_page(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    viewer.go_to(24)
+    find(viewer, qtbot, "Page 2")
+    assert viewer.matches[viewer.match][0] == 24
+
+
+def test_matches_are_highlighted(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    find(viewer, qtbot, "Page 1")
+    qtbot.waitUntil(lambda: 0 in rendered(viewer))
+    r = viewer.matches[0][1]
+    pixel = viewer.labels[0].pixmap().toImage().pixelColor(int(r.x0 + 2), int(r.y0 + 2))
+    assert pixel.blue() < 200 < pixel.red(), "current match tinted orange"
+
+
+def test_no_results_and_close(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    find(viewer, qtbot, "zebra")
+    assert viewer.find_count.text().strip() == "No results"
+    viewer.close_find()
+    assert not viewer.find_bar.isVisible() and viewer.matches == []
+
+
+def test_opening_another_file_resets_search(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    find(viewer, qtbot, "Page")
+    viewer.open(str(pdf))
+    assert viewer.matches == [] and viewer.find_count.text() == ""
+
+
+def test_sidebar_ignores_sliver_of_previous_page(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    viewer.scroll.verticalScrollBar().setValue(viewer.labels[6].y() - 40)  # 40px of page 6 still showing
+    qtbot.waitUntil(lambda: viewer.thumbs.currentRow() == 6)
