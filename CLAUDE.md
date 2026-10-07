@@ -9,6 +9,7 @@ Python + PySide6 (UI) + PyMuPDF (PDF engine). Windows-first desktop app, release
 3. Keep it minimal: no new dependency when PyMuPDF, Qt or the stdlib already cover it.
 4. The app opens untrusted files: never execute embedded PDF JavaScript or launch embedded attachments.
 5. Commit messages: no `Co-Authored-By` trailer.
+6. EPUB output (`epub.py`) must pass W3C EPUBCheck with 0 errors/warnings: `java -jar %LOCALAPPDATA%\epubcheck\epubcheck-5.4.0\epubcheck.jar book.epub`.
 
 ## Commands
 
