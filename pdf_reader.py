@@ -1,12 +1,15 @@
+import multiprocessing
 import sys
 from pathlib import Path
 
 import pymupdf
+
+import epub
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QScrollArea, QSplitter, QToolBar, QWidget,
+    QMainWindow, QMessageBox, QProgressDialog, QScrollArea, QSplitter, QToolBar, QWidget,
 )
 
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.25, 5.0
@@ -79,7 +82,10 @@ class Viewer(QMainWindow):
         self.setCentralWidget(split)
 
         for menu_name, items in {
-            "&File": [("&Open…", QKeySequence.Open, self.open_dialog), ("&Quit", QKeySequence.Quit, self.close)],
+            "&File": [("&Open…", QKeySequence.Open, self.open_dialog),
+                      ("Export as &EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
+                      ("Export as EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
+                      ("&Quit", QKeySequence.Quit, self.close)],
             "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
                       ("Find &Next", QKeySequence.FindNext, self.find_next),
                       ("Find &Previous", QKeySequence.FindPrevious, self.find_prev)],
@@ -98,6 +104,7 @@ class Viewer(QMainWindow):
             self.open(path)
 
     def open(self, path):
+        password = None
         try:
             doc = pymupdf.open(path)
             prompt = "This PDF is protected. Password:"
@@ -106,12 +113,13 @@ class Viewer(QMainWindow):
                 if not ok:
                     return False
                 if doc.authenticate(pw):
+                    password = pw  # the EPUB export reopens the file
                     break
                 prompt = "Wrong password. Try again:"
         except Exception as e:
             QMessageBox.critical(self, "Cannot open file", f"{path}\n\n{e}")
             return False
-        self.doc = doc
+        self.doc, self.path, self.password = doc, path, password
         self.query, self.matches, self.match, self.marks = None, [], -1, {}
         self.find_count.clear()
         self.setWindowTitle(f"{Path(path).name} — PDF Reader")
@@ -122,6 +130,35 @@ class Viewer(QMainWindow):
             self.thumbs.addItem(QListWidgetItem(QIcon(blank), str(i + 1)))
         self.build_pages()
         return True
+
+    def export_epub(self, mode):
+        if not self.doc:
+            return
+        default = str(Path(self.path).with_suffix(".epub"))
+        target, _ = QFileDialog.getSaveFileName(self, "Export as EPUB", default, "EPUB books (*.epub)")
+        if not target:
+            return
+        dialog = QProgressDialog("Converting to EPUB…", "Cancel", 0, 100, self)
+        dialog.setWindowTitle("Export as EPUB")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+
+        def progress(done, total):
+            dialog.setMaximum(total)
+            dialog.setValue(done)
+            QApplication.processEvents()
+            return not dialog.wasCanceled()
+
+        try:
+            epub.convert(self.path, target, mode, progress, self.password)
+        except epub.Cancelled:
+            return
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", f"{target}\n\n{e}")
+            return
+        finally:
+            dialog.close()
+        self.statusBar().showMessage(f"Saved {target}", 10000)
 
     def build_pages(self):
         for label in self.labels:
@@ -318,4 +355,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()  # the .exe re-launches itself for EPUB page-rendering workers
     main()
