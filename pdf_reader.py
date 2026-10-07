@@ -2,14 +2,15 @@ import sys
 from pathlib import Path
 
 import pymupdf
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap
+from PySide6.QtCore import QEvent, QSize, Qt, QTimer
+from PySide6.QtGui import QAction, QIcon, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
     QMainWindow, QMessageBox, QScrollArea, QSplitter, QVBoxLayout, QWidget,
 )
 
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.25, 5.0
+THUMB_ZOOM = 0.2
 
 
 def render(page, zoom, dpr=1.0):
@@ -31,6 +32,7 @@ class Viewer(QMainWindow):
         self.thumbs.setAccessibleName("Page thumbnails")
         self.thumbs.setIconSize(QSize(100, 130))
         self.thumbs.currentRowChanged.connect(self.go_to)
+        self.thumbs.verticalScrollBar().valueChanged.connect(self.schedule_render)
 
         self.pages = QWidget()
         self.pages.setStyleSheet("background: #c8c8c8")  # page edges stand out
@@ -40,7 +42,10 @@ class Viewer(QMainWindow):
         self.scroll.setWidgetResizable(True)
         self.scroll.setWidget(self.pages)
         self.scroll.setAccessibleName("Document")
-        self.scroll.verticalScrollBar().valueChanged.connect(self.render_visible)
+        self.scroll.verticalScrollBar().valueChanged.connect(self.schedule_render)
+        self.scroll.viewport().installEventFilter(self)  # Ctrl+wheel zoom
+        # Scanned pages take ~0.3s each: render once scrolling pauses, not on every scroll tick.
+        self.render_timer = QTimer(self, singleShot=True, interval=60, timeout=self.render_visible)
 
         split = QSplitter()
         split.addWidget(self.thumbs)
@@ -81,9 +86,10 @@ class Viewer(QMainWindow):
         self.doc = doc
         self.setWindowTitle(f"{Path(path).name} — PDF Reader")
         self.thumbs.clear()
-        # ponytail: all thumbnails rendered up front; make lazy if 1000+ page files feel slow to open
-        for i, page in enumerate(doc):
-            self.thumbs.addItem(QListWidgetItem(render(page, 0.2, self.devicePixelRatioF()), str(i + 1)))
+        blank = QPixmap(self.thumbs.iconSize())
+        blank.fill(Qt.white)
+        for i in range(len(doc)):
+            self.thumbs.addItem(QListWidgetItem(QIcon(blank), str(i + 1)))
         self.build_pages()
         return True
 
@@ -94,7 +100,8 @@ class Viewer(QMainWindow):
         for i, page in enumerate(self.doc):
             label = QLabel()
             label.setAccessibleName(f"Page {i + 1}")
-            label.setFixedSize(int(page.rect.width * self.zoom), int(page.rect.height * self.zoom))
+            label.page_size = page.rect.width, page.rect.height
+            label.setFixedSize(*self.scaled(label))
             label.setStyleSheet("background: white")
             label.rendered = False
             self.column.addWidget(label)
@@ -102,20 +109,43 @@ class Viewer(QMainWindow):
             self.labels.append(label)
         QTimer.singleShot(0, self.render_visible)  # geometry is only known after layout
 
-    def set_zoom(self, zoom):
+    def set_zoom(self, zoom, anchor_y=0):
+        """Zoom keeping the document point at viewport height anchor_y still (the mouse, for Ctrl+wheel)."""
         if not self.doc:
             return
-        top_page = self.current_page()
+        self.sync_layout()
+        bar = self.scroll.verticalScrollBar()
+        y = bar.value() + anchor_y
+        i = self.page_at(y)
+        frac = (y - self.labels[i].y()) / self.labels[i].height()
         self.zoom = max(ZOOM_MIN, min(ZOOM_MAX, zoom))
-        for label, page in zip(self.labels, self.doc):
-            label.setFixedSize(int(page.rect.width * self.zoom), int(page.rect.height * self.zoom))
+        for label in self.labels:
+            label.setFixedSize(*self.scaled(label))
             label.clear()
             label.rendered = False
-        QTimer.singleShot(0, lambda: self.go_to(top_page))
+        self.sync_layout()
+        bar.setValue(int(self.labels[i].y() + frac * self.labels[i].height() - anchor_y))
+        self.schedule_render()  # a touchpad pinch sends many events: draw once it settles
+
+    def scaled(self, label):
+        w, h = label.page_size
+        return int(w * self.zoom), int(h * self.zoom)
+
+    def schedule_render(self):
+        self.render_timer.start()
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Wheel and event.modifiers() & Qt.ControlModifier:
+            # 120 = one mouse-wheel notch; touchpads send smaller steps
+            self.set_zoom(self.zoom * ZOOM_STEP ** (event.angleDelta().y() / 120), event.position().y())
+            return True
+        return super().eventFilter(obj, event)
+
+    def page_at(self, y):
+        return next((i for i, l in enumerate(self.labels) if l.geometry().bottom() >= y), len(self.labels) - 1)
 
     def current_page(self):
-        y = self.scroll.verticalScrollBar().value()
-        return next((i for i, l in enumerate(self.labels) if l.geometry().bottom() >= y), 0)
+        return self.page_at(self.scroll.verticalScrollBar().value())
 
     def go_to(self, index):
         if 0 <= index < len(self.labels):
@@ -124,18 +154,38 @@ class Viewer(QMainWindow):
             self.render_visible()
 
     def render_visible(self):
-        """Render only pages in view and free the rest, so memory stays flat on big files."""
+        """Draw one missing page or thumbnail per call, pages first, then yield to the event loop.
+
+        A scanned page costs ~0.3s whatever the zoom, so drawing a batch at once freezes the window.
+        Off-screen pages are freed, so memory stays flat on big files.
+        """
         self.sync_layout()
         top = self.scroll.verticalScrollBar().value()
         bottom = top + self.scroll.viewport().height()
-        for label, page in zip(self.labels, self.doc or []):
+        todo = []
+        for i, label in enumerate(self.labels):
             visible = label.y() <= bottom and label.y() + label.height() >= top
             if visible and not label.rendered:
-                label.setPixmap(render(page, self.zoom, self.devicePixelRatioF()))
-                label.rendered = True
+                todo.append(("page", i))
             elif not visible and label.rendered:
                 label.clear()
                 label.rendered = False
+        view = self.thumbs.viewport().rect()
+        for i in range(self.thumbs.count()):
+            item = self.thumbs.item(i)
+            if not item.data(Qt.UserRole) and self.thumbs.visualItemRect(item).intersects(view):
+                todo.append(("thumb", i))
+        if not todo:
+            return
+        kind, i = todo[0]
+        dpr = self.devicePixelRatioF()
+        if kind == "page":
+            self.labels[i].setPixmap(render(self.doc[i], self.zoom, dpr))
+            self.labels[i].rendered = True
+        else:
+            self.thumbs.item(i).setIcon(QIcon(render(self.doc[i], THUMB_ZOOM, dpr)))
+            self.thumbs.item(i).setData(Qt.UserRole, True)  # thumbnails are small: keep them once drawn
+        QTimer.singleShot(1, self.render_visible)  # 1ms, not 0: lets timers and input run in between
 
     def sync_layout(self):
         """Place pages now instead of on the next event-loop tick, so y positions and scroll range are real."""
