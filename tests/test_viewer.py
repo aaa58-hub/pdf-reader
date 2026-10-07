@@ -133,3 +133,28 @@ def test_repeated_zoom_stays_on_page(viewer, pdf, qtbot):
     ctrl_wheel(viewer, -3)
     assert viewer.current_page() == 20
     qtbot.waitUntil(lambda: 20 in rendered(viewer))
+
+
+def test_long_document_zoomed_in_pages_do_not_overlap(viewer, tmp_path):
+    # 150 pages x 800pt at 500% = ~600k px: past Qt layouts' 524287px cap that made pages overlap
+    path = tmp_path / "long.pdf"
+    doc = pymupdf.open()
+    for _ in range(150):
+        doc.new_page(width=600, height=800)
+    doc.save(path)
+    viewer.open(str(path))
+    viewer.set_zoom(5.0)
+    labels = viewer.labels
+    assert all(a.y() + a.height() < b.y() for a, b in zip(labels, labels[1:]))
+    assert viewer.pages.height() > labels[-1].y() + labels[-1].height()
+
+
+def test_sidebar_follows_scrolled_page(viewer, pdf, qtbot):
+    viewer.open(str(pdf))
+    bar = viewer.scroll.verticalScrollBar()
+    target = viewer.labels[15].y() + 100  # partway into page 16
+    bar.setValue(target)
+    qtbot.waitUntil(lambda: viewer.thumbs.currentRow() == 15)
+    assert bar.value() == target, "highlighting the thumbnail must not snap the document"
+    item_rect = viewer.thumbs.visualItemRect(viewer.thumbs.item(15))
+    assert viewer.thumbs.viewport().rect().intersects(item_rect), "current thumbnail scrolled into view"
