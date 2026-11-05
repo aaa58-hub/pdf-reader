@@ -6,16 +6,17 @@ import pymupdf
 
 import epub
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMessageBox, QProgressDialog, QScrollArea, QSplitter, QToolBar, QWidget,
+    QMainWindow, QMenu, QMessageBox, QProgressDialog, QScrollArea, QSplitter, QToolBar, QWidget,
 )
 
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.25, 5.0
 THUMB_ZOOM = 0.2
 GAP = 8  # px around pages
 MATCH, CURRENT_MATCH = QColor(255, 220, 0, 90), QColor(255, 120, 0, 130)
+DRAG_MIN = 4  # px: a shorter drag is a click, not a selection
 
 
 def render(page, zoom, dpr=1.0, marks=(), current=None):
@@ -24,13 +25,30 @@ def render(page, zoom, dpr=1.0, marks=(), current=None):
     img = QImage(pix.samples, pix.width, pix.height, pix.stride, QImage.Format_RGB888).copy()  # copy: samples die with pix
     pm = QPixmap.fromImage(img)
     pm.setDevicePixelRatio(dpr)  # sharp text on 125%/150% Windows scaling
+    paint(pm, marks, zoom, current)
+    return pm
+
+
+def paint(pm, marks, zoom, current=None):
     if marks:
         painter = QPainter(pm)
         for r in marks:
             painter.fillRect(QRectF(r.x0 * zoom, r.y0 * zoom, r.width * zoom, r.height * zoom),
                              CURRENT_MATCH if r == current else MATCH)
         painter.end()
-    return pm
+
+
+def nearest_word(words, point):
+    return min(range(len(words)), key=lambda k: point.distance_to(pymupdf.Rect(words[k][:4])))
+
+
+def selected_lines(words, a, b):
+    """Words a..b in reading order (like a text selection), one rect per line so highlights have no gaps."""
+    lines = {}
+    for w in words[min(a, b):max(a, b) + 1]:
+        key, r = (w[5], w[6]), pymupdf.Rect(w[:4])  # (block, line)
+        lines[key] = lines[key] | r if key in lines else r
+    return list(lines.values())
 
 
 class Viewer(QMainWindow):
@@ -41,6 +59,7 @@ class Viewer(QMainWindow):
         self.doc, self.zoom, self.labels = None, 1.0, []
         self.query, self.matches, self.match = None, [], -1  # matches: [(page index, rect)]
         self.marks = {}  # page index -> rects, for painting
+        self.drag = None  # highlight being dragged: (page index, words, first word, press pos, page pixmap)
 
         self.thumbs = QListWidget()
         self.thumbs.setAccessibleName("Page thumbnails")
@@ -55,6 +74,7 @@ class Viewer(QMainWindow):
         self.scroll.setAccessibleName("Document")
         self.scroll.verticalScrollBar().valueChanged.connect(self.schedule_render)
         self.scroll.viewport().installEventFilter(self)  # Ctrl+wheel zoom, re-centre pages on resize
+        self.pages.installEventFilter(self)  # clicks on pages: annotation tools (QLabel passes them up)
         # Scanned pages take ~0.3s each: render once scrolling pauses, not on every scroll tick.
         self.render_timer = QTimer(self, singleShot=True, interval=60, timeout=self.render_visible)
 
@@ -73,6 +93,16 @@ class Viewer(QMainWindow):
         close.setToolTip("Close (Esc)")
         close.setShortcut(Qt.Key_Escape)
         close.setShortcutContext(Qt.WidgetWithChildrenShortcut)  # Esc only while the find bar has focus
+        tools = QActionGroup(self)
+        tools.setExclusionPolicy(QActionGroup.ExclusionPolicy.ExclusiveOptional)  # both off = just reading
+        tools.triggered.connect(self.tool_changed)
+        self.highlight_tool = QAction("&Highlight Text", tools, checkable=True, shortcut="Ctrl+Shift+H",
+                                      toolTip="Highlight text: drag across it (Ctrl+Shift+H)")
+        self.note_tool = QAction("Add &Note", tools, checkable=True, shortcut="Ctrl+Shift+N",
+                                 toolTip="Add a note: click where it goes (Ctrl+Shift+N)")
+        annotate_bar = QToolBar("Annotate", movable=False)
+        annotate_bar.addActions(tools.actions())
+        self.addToolBar(annotate_bar)
         self.addToolBar(self.find_bar)
 
         split = QSplitter()
@@ -83,6 +113,8 @@ class Viewer(QMainWindow):
 
         for menu_name, items in {
             "&File": [("&Open…", QKeySequence.Open, self.open_dialog),
+                      ("&Save", QKeySequence.Save, self.save),
+                      ("Save &As…", QKeySequence.SaveAs, self.save_as),
                       ("Export as &EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
                       ("Export as EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
                       ("&Quit", QKeySequence.Quit, self.close)],
@@ -97,13 +129,30 @@ class Viewer(QMainWindow):
             for text, keys, slot in items:
                 action = QAction(text, self, shortcut=keys, triggered=slot)
                 menu.addAction(action)
+        self.menuBar().addMenu("&Annotate").addActions(tools.actions())
 
     def open_dialog(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open PDF", "", "PDF files (*.pdf)")
         if path:
             self.open(path)
 
+    def keep_changes_or_discard(self):
+        """True when the open document may be dropped: no unsaved changes, saved now, or the user says so."""
+        if not self.isWindowModified():
+            return True
+        answer = QMessageBox.question(self, "Unsaved changes", f"Save changes to {Path(self.path).name}?",
+                                      QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
+        if answer == QMessageBox.Save:
+            return self.save()
+        return answer == QMessageBox.Discard
+
+    def closeEvent(self, event):
+        if not self.keep_changes_or_discard():
+            event.ignore()
+
     def open(self, path):
+        if not self.keep_changes_or_discard():
+            return False
         password = None
         try:
             doc = pymupdf.open(path)
@@ -121,8 +170,10 @@ class Viewer(QMainWindow):
             return False
         self.doc, self.path, self.password = doc, path, password
         self.query, self.matches, self.match, self.marks = None, [], -1, {}
+        self.drag = None
         self.find_count.clear()
-        self.setWindowTitle(f"{Path(path).name} — PDF Reader")
+        self.setWindowTitle(f"{Path(path).name}[*] — PDF Reader")  # [*]: Qt shows "*" while modified
+        self.setWindowModified(False)
         self.thumbs.clear()
         blank = QPixmap(self.thumbs.iconSize())
         blank.fill(Qt.white)
@@ -160,6 +211,137 @@ class Viewer(QMainWindow):
             dialog.close()
         self.statusBar().showMessage(f"Saved {target}", 10000)
 
+    def save(self):
+        """Append the changes to the open file: fast, and the original bytes stay intact underneath."""
+        if not self.doc:
+            return False
+        if not self.doc.can_save_incrementally():  # e.g. a damaged file MuPDF had to repair
+            return self.save_as()
+        try:
+            self.doc.saveIncr()  # keeps the password, if any
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"{self.path}\n\n{e}")
+            return False
+        self.setWindowModified(False)
+        self.statusBar().showMessage(f"Saved {self.path}", 10000)
+        return True
+
+    def save_as(self):
+        if not self.doc:
+            return False
+        target, _ = QFileDialog.getSaveFileName(self, "Save As", self.path, "PDF files (*.pdf)")
+        if not target:
+            return False
+        if Path(target).resolve() == Path(self.path).resolve():
+            if self.doc.can_save_incrementally():
+                return self.save()
+            QMessageBox.warning(self, "Save As", "This file can't be updated in place. Choose a new name.")
+            return False
+        try:
+            self.doc.save(target, encryption=pymupdf.PDF_ENCRYPT_KEEP)  # PyMuPDF's default drops the password
+            doc = pymupdf.open(target)  # carry on editing the new file, so Save goes there
+            if self.password:
+                doc.authenticate(self.password)
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", f"{target}\n\n{e}")
+            return False
+        self.doc.close()
+        self.doc, self.path = doc, target  # same pages: what's on screen stays valid
+        self.setWindowTitle(f"{Path(target).name}[*] — PDF Reader")
+        self.setWindowModified(False)
+        self.statusBar().showMessage(f"Saved {target}", 10000)
+        return True
+
+    def tool_changed(self):
+        cursor = Qt.IBeamCursor if self.highlight_tool.isChecked() else (
+            Qt.CrossCursor if self.note_tool.isChecked() else Qt.ArrowCursor)
+        self.pages.setCursor(cursor)
+
+    def at(self, pos):
+        """(page index, PDF point) under a point of the pages widget, or None in the gaps between pages."""
+        label = self.pages.childAt(pos)
+        if not self.doc or label not in self.labels:
+            return None
+        p = label.mapFromParent(pos)
+        return label.index, pymupdf.Point(p.x(), p.y()) / self.zoom * self.doc[label.index].derotation_matrix
+
+    def annot_at(self, i, point):
+        page = self.doc[i]  # returned too: an annot is only usable while its page object lives
+        return page, next((a for a in reversed(list(page.annots())) if point in a.rect), None)  # topmost
+
+    def page_mouse(self, event):
+        """Annotation tools. Returns True when the event was used."""
+        kind = event.type()
+        if kind == QEvent.ContextMenu:
+            hit = self.at(event.pos())
+            page, annot = self.annot_at(*hit) if hit else (None, None)
+            if annot:
+                self.annot_menu(hit[0], page, annot, event.globalPos())
+            return bool(annot)
+        if kind not in (QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.MouseButtonRelease):
+            return False
+        pos = event.position().toPoint()
+        if kind == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+            hit = self.at(pos)
+            if not hit:
+                return False
+            i, point = hit
+            if self.highlight_tool.isChecked():
+                words = self.doc[i].get_text("words")
+                if words:
+                    self.drag = i, words, nearest_word(words, point), pos, self.labels[i].pixmap()
+                return True
+            page, annot = self.annot_at(i, point)
+            if annot and annot.type[0] == pymupdf.PDF_ANNOT_TEXT:  # click a note to read or edit it
+                self.edit_note(i, page, annot)
+            elif self.note_tool.isChecked():
+                text, ok = QInputDialog.getMultiLineText(self, "Add Note", "Note:")
+                if ok and text.strip():
+                    page.add_text_annot(point, text)
+                    self.changed(i)
+            return bool(annot) or self.note_tool.isChecked()
+        if not self.drag:
+            return False
+        i, words, first, start, base = self.drag
+        hit = self.at(pos)
+        last = nearest_word(words, hit[1]) if hit and hit[0] == i else None
+        moved = (pos - start).manhattanLength() >= DRAG_MIN
+        if kind == QEvent.MouseMove:
+            if last is not None and moved and not base.isNull():  # preview, painted over the page already drawn
+                pm = QPixmap(base)
+                rot = self.doc[i].rotation_matrix
+                paint(pm, [r * rot for r in selected_lines(words, first, last)], self.zoom)
+                self.labels[i].setPixmap(pm)
+        elif event.button() == Qt.LeftButton:
+            self.drag = None
+            if last is not None and moved:
+                self.doc[i].add_highlight_annot(quads=[r.quad for r in selected_lines(words, first, last)])
+                self.changed(i)
+            elif not base.isNull():
+                self.labels[i].setPixmap(base)
+        return True
+
+    def edit_note(self, i, page, annot):
+        text, ok = QInputDialog.getMultiLineText(self, "Note", "Note:", annot.info["content"])
+        if ok and text != annot.info["content"]:
+            annot.set_info(content=text)
+            annot.update()
+            self.changed(i)
+
+    def annot_menu(self, i, page, annot, global_pos):
+        menu = QMenu(self)
+        if annot.type[0] == pymupdf.PDF_ANNOT_TEXT:
+            menu.addAction("&Edit Note…", lambda: self.edit_note(i, page, annot))
+        menu.addAction("&Delete", lambda: (page.delete_annot(annot), self.changed(i)))
+        menu.exec(global_pos)
+
+    def changed(self, i):
+        """Page i's annotations changed: redraw it and its thumbnail, mark the document unsaved."""
+        self.setWindowModified(True)
+        self.labels[i].rendered = False
+        self.thumbs.item(i).setData(Qt.UserRole, None)
+        self.render_visible()
+
     def build_pages(self):
         for label in self.labels:
             label.deleteLater()
@@ -167,6 +349,7 @@ class Viewer(QMainWindow):
         for i, page in enumerate(self.doc):
             label = QLabel(self.pages)
             label.setAccessibleName(f"Page {i + 1}")
+            label.index = i
             label.page_size = page.rect.width, page.rect.height
             label.setFixedSize(*self.scaled(label))
             label.setStyleSheet("background: white")
@@ -214,6 +397,8 @@ class Viewer(QMainWindow):
         self.render_timer.start()
 
     def eventFilter(self, obj, event):
+        if obj is self.pages:
+            return self.page_mouse(event) or super().eventFilter(obj, event)
         if event.type() == QEvent.Resize:
             self.place_pages()
             self.schedule_render()
