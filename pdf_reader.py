@@ -5,6 +5,7 @@ from pathlib import Path
 import pymupdf
 
 import epub
+import word
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
@@ -115,8 +116,11 @@ class Viewer(QMainWindow):
             "&File": [("&Open…", QKeySequence.Open, self.open_dialog),
                       ("&Save", QKeySequence.Save, self.save),
                       ("Save &As…", QKeySequence.SaveAs, self.save_as),
-                      ("Export as &EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
-                      ("Export as EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
+                      ("&Export", None, [
+                          ("&EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
+                          ("EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
+                          ("&Word document (page layout)…", "Ctrl+Shift+D", lambda: self.export_word("layout")),
+                          ("Word document (&reflowable text)…", "", lambda: self.export_word("flow"))]),
                       ("&Quit", QKeySequence.Quit, self.close)],
             "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
                       ("Find &Next", QKeySequence.FindNext, self.find_next),
@@ -127,8 +131,11 @@ class Viewer(QMainWindow):
         }.items():
             menu = self.menuBar().addMenu(menu_name)
             for text, keys, slot in items:
-                action = QAction(text, self, shortcut=keys, triggered=slot)
-                menu.addAction(action)
+                if isinstance(slot, list):  # submenu
+                    sub = menu.addMenu(text)
+                    sub.addActions([QAction(t, self, shortcut=k, triggered=s) for t, k, s in slot])
+                else:
+                    menu.addAction(QAction(text, self, shortcut=keys, triggered=slot))
         self.menuBar().addMenu("&Annotate").addActions(tools.actions())
 
     def open_dialog(self):
@@ -183,14 +190,23 @@ class Viewer(QMainWindow):
         return True
 
     def export_epub(self, mode):
+        self.export("EPUB", ".epub", "EPUB books (*.epub)",
+                    lambda target, progress: epub.convert(self.path, target, mode, progress, self.password))
+
+    def export_word(self, mode):
+        self.export("Word", ".docx", "Word documents (*.docx)",
+                    lambda target, progress: word.convert(self.path, target, mode, progress, self.password))
+
+    def export(self, name, suffix, file_filter, convert):
+        """Ask where to save, then run convert(target, progress) behind a cancellable progress dialog."""
         if not self.doc:
             return
-        default = str(Path(self.path).with_suffix(".epub"))
-        target, _ = QFileDialog.getSaveFileName(self, "Export as EPUB", default, "EPUB books (*.epub)")
+        default = str(Path(self.path).with_suffix(suffix))
+        target, _ = QFileDialog.getSaveFileName(self, f"Export as {name}", default, file_filter)
         if not target:
             return
-        dialog = QProgressDialog("Converting to EPUB…", "Cancel", 0, 100, self)
-        dialog.setWindowTitle("Export as EPUB")
+        dialog = QProgressDialog(f"Converting to {name}…", "Cancel", 0, 100, self)
+        dialog.setWindowTitle(f"Export as {name}")
         dialog.setWindowModality(Qt.WindowModal)
         dialog.setMinimumDuration(0)
 
@@ -201,7 +217,7 @@ class Viewer(QMainWindow):
             return not dialog.wasCanceled()
 
         try:
-            epub.convert(self.path, target, mode, progress, self.password)
+            convert(target, progress)
         except epub.Cancelled:
             return
         except Exception as e:
