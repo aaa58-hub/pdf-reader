@@ -26,6 +26,9 @@ STOPWORDS = {
     "de": "der die und das ist nicht mit den ein sich".split(),
     "es": "el la de que y los las por una con".split(),
 }
+# word split at the line end: "-", OCR's "¬", soft hyphen, or a hyphen OCR lost as U+FFFD
+HYPHENATED = re.compile("\\w[-\u00ac\u00ad\ufffd]$")
+CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")  # not allowed in XML, and OCR emits them
 # characters ordinary prose doesn't use: lots of them means OCR read a picture as text
 ODD_CHARS = re.compile(r"[^\w\s.,;:!?'\"()\[\]\-\u2013\u2014\u2018\u2019\u201c\u201d&%/]")
 ROMAN = re.compile(r"[IVXLC]+\.?")
@@ -50,10 +53,15 @@ def convert(pdf_path, epub_path, mode="reflow", progress=lambda done, total: Tru
         fixed_layout(doc, book, progress, password)
     else:
         reflow(doc, book, progress, password)
-    tmp = epub_path + ".part"  # never leave a half-written file under the real name
+    write_atomically(epub_path, book.write)
+
+
+def write_atomically(path, write):
+    """write(tmp) then rename: never leave a half-written file under the real name."""
+    tmp = path + ".part"
     try:
-        book.write(tmp)
-        os.replace(tmp, epub_path)
+        write(tmp)
+        os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
@@ -131,12 +139,12 @@ def block_text(block):
         part = re.sub(r"\s+", " ", "".join(s["text"] for s in line["spans"])).strip()
         if not part:
             continue
-        if re.search(r"\w[-�]$", text) and part[:1].islower():
+        if HYPHENATED.search(text) and part[:1].islower():
             text = text[:-1] + part  # "manu-" + "facture"
         else:
             text = f"{text} {part}" if text else part
     text = re.sub(r"(?<=\w)�(?=\w)", "’", text)  # OCR loses curly apostrophes as U+FFFD
-    return text.replace("�", "").strip()
+    return CONTROL.sub("", text.replace("�", "")).strip()
 
 
 def block_size(block):
@@ -162,7 +170,12 @@ def looks_like_heading(text):
             and sum(w[0].isupper() for w in words) >= 0.6 * len(words))
 
 
-def reflow(doc, book, progress, password):
+def structure(doc, progress, password, cover=True):
+    """The book's text, recovered heuristically, for the reflowable formats (EPUB, Word).
+
+    Returns (chapters, cover JPEG or None). A chapter is [title or None, parts, first page index];
+    a part is ("h", heading, None), ("p", paragraph, None) or ("img", alt text, (JPEG, width pt, height pt)).
+    """
     n = len(doc)
     pages = []  # per page: list of (kind, payload) in reading order
     heads = Counter()  # normalised top-margin text -> pages it appears on
@@ -181,13 +194,13 @@ def reflow(doc, book, progress, password):
             if bbox.width * bbox.height > SCAN_COVERAGE * area:
                 scanned = True
             elif width >= 32 and height >= 32:
-                figures.append((bbox.y0, xref))
+                figures.append((bbox.y0, xref, bbox.width, bbox.height))
         figures.sort()
         no_images = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
         for b in page.get_text("dict", flags=no_images)["blocks"]:
             x0, y0, x1, y1 = b["bbox"]
             while figures and figures[0][0] <= y0:  # figure goes before the first text below it
-                blocks.append(("img", figures.pop(0)[1]))
+                blocks.append(("img", figures.pop(0)[1:]))
             text = block_text(b)
             if not text or is_noise(text):
                 continue
@@ -200,18 +213,18 @@ def reflow(doc, book, progress, password):
                 heads[key] += 1
             sizes[size] += len(text)
             blocks.append(("text", (text, size, len(b["lines"]), key if top else None)))
-        blocks += [("img", xref) for _, xref in figures]
+        blocks += [("img", f[1:]) for f in figures]
         words = sum(len(p[0].split()) for kind, p in blocks if kind == "text")
         if scanned and words < 40:  # plate, title page, illustration: keep the page as a picture
             blocks = [("page", i)]
         pages.append(blocks)
 
-    pictured = sorted({0} | {i for i, blocks in enumerate(pages) if blocks[:1] == [("page", i)]})
+    pictured = sorted(({0} if cover else set()) | {i for i, blocks in enumerate(pages) if blocks[:1] == [("page", i)]})
     pictures = render_pages(doc.name, password, pictured, progress, n, n + len(pictured))
 
     body = sizes.most_common(1)[0][0] if sizes else 10
     bookmarks = toc_starts(doc)
-    chapters = []  # [title, [html parts], first page]
+    chapters = []  # [title, parts, first page]
 
     def start_chapter(title, page_index):
         if chapters and not chapters[-1][1]:
@@ -225,18 +238,20 @@ def reflow(doc, book, progress, password):
             start_chapter(bookmarks.get(i), i)  # 40-page cap: huge files are slow on e-readers
         for kind, payload in blocks:
             parts = chapters[-1][1]
-            if kind in ("img", "page"):
-                data = pictures[payload] if kind == "page" else jpeg(pymupdf.Pixmap(doc, payload))
-                name = book.add_image(data, "jpg")
-                alt = f"Page {i + 1}" if kind == "page" else f"Figure on page {i + 1}"
-                parts.append(f'<figure><img src="{name}" alt="{alt}"/></figure>')
+            if kind == "page":
+                parts.append(("img", f"Page {i + 1}", (pictures[i], doc[i].rect.width, doc[i].rect.height)))
+                last_para = None
+                continue
+            if kind == "img":
+                xref, w, h = payload
+                parts.append(("img", f"Figure on page {i + 1}", (jpeg(pymupdf.Pixmap(doc, xref)), w, h)))
                 last_para = None
                 continue
             text, size, lines, head_key = payload
             if head_key and heads[head_key] >= 3:
                 continue  # running head repeated across pages
             if size >= body * 1.3 and lines <= 3 and len(text) <= 100 and looks_like_heading(text):
-                only_headings = all(part.startswith("<h2>") for part in parts)
+                only_headings = all(part[0] == "h" for part in parts)
                 if not bookmarks and not only_headings:
                     start_chapter(text, i)
                     parts = chapters[-1][1]
@@ -245,25 +260,40 @@ def reflow(doc, book, progress, password):
                     chapters[-1][0] = f"{chapters[-1][0]} \u2014 {text}" if chapters[-1][0] else text
                 elif not chapters[-1][0]:
                     chapters[-1][0] = text
-                parts.append(f"<h2>{html.escape(text)}</h2>")
+                parts.append(("h", text, None))
                 last_para = None
                 continue
-            if (last_para and last_para[1] >= i - 1 and parts and parts[-1].startswith("<p>")
+            if (last_para and last_para[1] >= i - 1 and parts and parts[-1][0] == "p"
                     and not re.search(r"[.!?:;\"”’)]$", last_para[0]) and text[:1].islower()):
                 # sentence split across blocks (one block per line) or by the page turn: glue it back
-                joined = last_para[0][:-1] + text if last_para[0].endswith("-") else f"{last_para[0]} {text}"
-                parts[-1] = f"<p>{html.escape(joined)}</p>"
+                joined = (last_para[0][:-1] + text if HYPHENATED.search(last_para[0])
+                          else f"{last_para[0]} {text}")
+                parts[-1] = ("p", joined, None)
                 last_para = [joined, i]
             else:
-                parts.append(f"<p>{html.escape(text)}</p>")
+                parts.append(("p", text, None))
                 last_para = [text, i]
+    return [c for c in chapters if c[1]], pictures.get(0) if cover else None
 
-    book.language = detect_language(" ".join(re.sub("<[^>]+>", " ", "".join(c[1])) for c in chapters[:20]))
-    if n:
-        book.add_image(pictures[0], "jpg", cover=True)
+
+def reflow(doc, book, progress, password):
+    chapters, cover = structure(doc, progress, password)
+    book.language = chapters_language(chapters)
+    if cover:
+        book.add_image(cover, "jpg", cover=True)
     for title, parts, first in chapters:
-        if parts:
-            book.add_chapter(title or f"From page {first + 1}", "\n".join(parts))
+        body = []
+        for kind, text, image in parts:
+            if kind == "img":
+                body.append(f'<figure><img src="{book.add_image(image[0], "jpg")}" alt="{html.escape(text)}"/></figure>')
+            else:
+                tag = "h2" if kind == "h" else "p"
+                body.append(f"<{tag}>{html.escape(text)}</{tag}>")
+        book.add_chapter(title or f"From page {first + 1}", "\n".join(body))
+
+
+def chapters_language(chapters):
+    return detect_language(" ".join(text for c in chapters[:20] for kind, text, _ in c[1] if kind != "img"))
 
 
 def detect_language(text):

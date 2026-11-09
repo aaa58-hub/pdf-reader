@@ -97,6 +97,12 @@ def test_export_menu(qtbot, book, tmp_path, monkeypatch):
     viewer.open(str(book))
     out = tmp_path / "from-menu.epub"
     monkeypatch.setattr("pdf_reader.QFileDialog.getSaveFileName", lambda *a: (str(out), ""))
-    [action] = [a for a in viewer.findChildren(QAction) if a.text().startswith("Export as &EPUB")]
+    [action] = [a for a in viewer.findChildren(QAction) if a.text() == "&EPUB (reflowable text)…"]
     action.trigger()
     assert out.exists() and "Saved" in viewer.statusBar().currentMessage()
+
+
+def test_line_end_hyphens_are_undone():
+    lines = ["the nineteenth cen\u00ac", "tury, a com-", "posing machine; Mono\u00ad", "type and Lino-", "Type"]
+    block = {"lines": [{"spans": [{"text": t}]} for t in lines]}
+    assert epub.block_text(block) == "the nineteenth century, a composing machine; Monotype and Lino- Type"
