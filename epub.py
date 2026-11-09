@@ -19,6 +19,9 @@ import pymupdf
 PAGE_IMAGE_HEIGHT = 1200  # px: sharp on phones and e-readers; scans compress badly, so not more
 SCAN_COVERAGE = 0.7  # an image covering this much of a page is a scan background, not a figure
 MARGIN = 0.1  # top/bottom share of the page where running heads and page numbers live
+FOLIO_ZONE = 0.15  # numbers this close to the top/bottom are page numbers too (some books print them higher)
+MIN_FIGURE = 24  # pt: smaller pictures are ornaments, bullets, rules
+FIGURE_ZOOM = 2  # 144 dpi: sharp on screens without bloating the file
 STOPWORDS = {
     "en": "the and of to in is that it was for".split(),
     "it": "il di che la per un non una sono della".split(),
@@ -73,6 +76,30 @@ def jpeg(pix):
     if pix.n not in (1, 3):
         pix = pymupdf.Pixmap(pymupdf.csRGB, pix)  # CMYK and friends aren't valid in EPUB JPEGs
     return pix.tobytes("jpeg", jpg_quality=70)
+
+
+def figure_jpeg(page, rect):
+    """The figure as it looks on the page: drawn, not extracted, so CMYK, transparency, stencil masks
+    and pictures made of many pieces all come out right."""
+    zoom = min(FIGURE_ZOOM, PAGE_IMAGE_HEIGHT / max(rect.width, rect.height))
+    return jpeg(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=rect, alpha=False))
+
+
+def merge_touching(rects):
+    """Union rects that overlap or touch: one illustration is often dozens of image pieces."""
+    rects = [pymupdf.Rect(r) for r in rects]
+    merged = True
+    while merged:
+        merged = False
+        for a in range(len(rects)):
+            for b in range(a + 1, len(rects)):
+                if rects[a].intersects(rects[b] + (-2, -2, 2, 2)):
+                    rects[a] |= rects.pop(b)
+                    merged = True
+                    break
+            if merged:
+                break
+    return rects
 
 
 def page_jpeg(page):
@@ -184,36 +211,45 @@ def structure(doc, progress, password, cover=True):
         if not progress(i, n):
             raise Cancelled
         area = page.rect.width * page.rect.height
-        blocks, scanned, figures = [], False, []
+        blocks, scanned, pieces = [], False, []
         # positions only: get_text(images) / get_image_info(xrefs) decode every scan, ~0.2s a page
         for img in page.get_images(full=True):
-            xref, width, height = img[0], img[2], img[3]
             bbox = page.get_image_bbox(img)
             if bbox.is_infinite or bbox.is_empty:
                 continue  # listed in resources but not drawn
             if bbox.width * bbox.height > SCAN_COVERAGE * area:
                 scanned = True
-            elif width >= 32 and height >= 32:
-                figures.append((bbox.y0, xref, bbox.width, bbox.height))
-        figures.sort()
+            else:
+                pieces.append(bbox & page.rect)
+        h = page.rect.height
+        texts, folios = [], []
         no_images = pymupdf.TEXTFLAGS_DICT & ~pymupdf.TEXT_PRESERVE_IMAGES
         for b in page.get_text("dict", flags=no_images)["blocks"]:
-            x0, y0, x1, y1 = b["bbox"]
-            while figures and figures[0][0] <= y0:  # figure goes before the first text below it
-                blocks.append(("img", figures.pop(0)[1:]))
             text = block_text(b)
             if not text or is_noise(text):
                 continue
+            y0, y1 = b["bbox"][1], b["bbox"][3]
+            top, bottom = y1 < h * MARGIN, y0 > h * (1 - MARGIN)
+            near_edge = y1 < h * FOLIO_ZONE or y0 > h * (1 - FOLIO_ZONE)
+            if len(text) <= 12 and (top or bottom or (near_edge and re.search(r"\d", text))):
+                folios.append(pymupdf.Rect(b["bbox"]))  # page number ("20", "c 33 m.b."), printer's mark
+            else:
+                texts.append((b, text, top))
+        figures = sorted((r for r in merge_touching(pieces) if min(r.width, r.height) >= MIN_FIGURE
+                          # small, with the page number printed on it: an ornament, not an illustration
+                          and not (r.width < page.rect.width / 4 and r.height < h / 4
+                                   and any(r.intersects(f) for f in folios))),
+                         key=lambda r: r.y0)
+        for b, text, top in texts:
+            while figures and figures[0].y0 <= b["bbox"][1]:  # figure goes before the first text below it
+                blocks.append(("img", figures.pop(0)))
             size = block_size(b)
-            top, bottom = y1 < page.rect.height * MARGIN, y0 > page.rect.height * (1 - MARGIN)
-            if (top or bottom) and len(text) <= 12:
-                continue  # page number, printer's signature mark
             key = re.sub(r"[^a-z]", "", text.lower())
             if top:
                 heads[key] += 1
             sizes[size] += len(text)
             blocks.append(("text", (text, size, len(b["lines"]), key if top else None)))
-        blocks += [("img", f[1:]) for f in figures]
+        blocks += [("img", f) for f in figures]
         words = sum(len(p[0].split()) for kind, p in blocks if kind == "text")
         if scanned and words < 40:  # plate, title page, illustration: keep the page as a picture
             blocks = [("page", i)]
@@ -232,7 +268,7 @@ def structure(doc, progress, password, cover=True):
         else:
             chapters.append([title, [], page_index])
 
-    last_para = None  # [text, page index] of the paragraph that may continue on the next page
+    last_page = None  # page of the last paragraph, which may continue on the next one; None after a heading
     for i, blocks in enumerate(pages):
         if i in bookmarks or not chapters or (not bookmarks and i - chapters[-1][2] >= 40):
             start_chapter(bookmarks.get(i), i)  # 40-page cap: huge files are slow on e-readers
@@ -240,12 +276,10 @@ def structure(doc, progress, password, cover=True):
             parts = chapters[-1][1]
             if kind == "page":
                 parts.append(("img", f"Page {i + 1}", (pictures[i], doc[i].rect.width, doc[i].rect.height)))
-                last_para = None
                 continue
             if kind == "img":
-                xref, w, h = payload
-                parts.append(("img", f"Figure on page {i + 1}", (jpeg(pymupdf.Pixmap(doc, xref)), w, h)))
-                last_para = None
+                parts.append(("img", f"Figure on page {i + 1}", (figure_jpeg(doc[i], payload), payload.width,
+                                                                  payload.height)))
                 continue
             text, size, lines, head_key = payload
             if head_key and heads[head_key] >= 3:
@@ -261,18 +295,19 @@ def structure(doc, progress, password, cover=True):
                 elif not chapters[-1][0]:
                     chapters[-1][0] = text
                 parts.append(("h", text, None))
-                last_para = None
+                last_page = None
                 continue
-            if (last_para and last_para[1] >= i - 1 and parts and parts[-1][0] == "p"
-                    and not re.search(r"[.!?:;\"”’)]$", last_para[0]) and text[:1].islower()):
+            k = len(parts) - 1
+            while k >= 0 and parts[k][0] == "img":
+                k -= 1  # a picture beside the text breaks the sentence, not the paragraph: it moves after it
+            prev = parts[k][1] if k >= 0 and parts[k][0] == "p" else None
+            if (prev and last_page is not None and last_page >= i - 1
+                    and not re.search(r"[.!?:;\"”’)]$", prev) and text[:1].islower()):
                 # sentence split across blocks (one block per line) or by the page turn: glue it back
-                joined = (last_para[0][:-1] + text if HYPHENATED.search(last_para[0])
-                          else f"{last_para[0]} {text}")
-                parts[-1] = ("p", joined, None)
-                last_para = [joined, i]
+                parts[k] = ("p", prev[:-1] + text if HYPHENATED.search(prev) else f"{prev} {text}", None)
             else:
                 parts.append(("p", text, None))
-                last_para = [text, i]
+            last_page = i
     return [c for c in chapters if c[1]], pictures.get(0) if cover else None
 
 

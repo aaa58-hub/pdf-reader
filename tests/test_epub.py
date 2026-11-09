@@ -106,3 +106,55 @@ def test_line_end_hyphens_are_undone():
     lines = ["the nineteenth cen\u00ac", "tury, a com-", "posing machine; Mono\u00ad", "type and Lino-", "Type"]
     block = {"lines": [{"spans": [{"text": t}]} for t in lines]}
     assert epub.block_text(block) == "the nineteenth century, a composing machine; Monotype and Lino- Type"
+
+
+@pytest.fixture
+def tricky(tmp_path):
+    """Things real PDFs do: a stencil-mask image (no colours of its own), one illustration made of
+    four touching image pieces, and page numbers printed above the usual bottom margin."""
+    path = tmp_path / "tricky.pdf"
+    doc = pymupdf.open()
+    tile = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+    tile.set_rect(tile.irect, (30, 120, 200))
+    for n in range(2):
+        page = doc.new_page(width=400, height=600)
+        text = BODY + " Winston made for the" if n == 0 else "stairs, slowly, resting several times."
+        page.insert_textbox(pymupdf.Rect(50, 150, 350, 400), text, fontsize=11)
+        page.insert_text((195, 530), str(n + 7), fontsize=10)  # 88% down the page
+    page = doc[0]
+    for x, y in [(50, 50), (90, 50), (50, 90), (90, 90)]:  # 2x2 tiles = one 80x80 picture
+        page.insert_image(pymupdf.Rect(x, y, x + 40, y + 40), pixmap=tile)
+    page.insert_image(pymupdf.Rect(200, 50, 280, 130), pixmap=tile)
+    stencil = page.get_images()[-1][0]
+    doc.update_object(stencil, "<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ImageMask true "
+                               "/BitsPerComponent 1 >>")
+    doc.update_stream(stencil, bytes([0b10101010, 0b01010101] * 256))
+    doc.save(path)
+    return path
+
+
+def test_tricky_images_and_page_numbers(tricky, tmp_path):
+    out = tmp_path / "tricky.epub"
+    epub.convert(str(tricky), str(out))  # used to fail: "cannot drop alpha for 'NULL' colorspace"
+    z, text = read(out)
+    assert text.count("<img") == 2, "the four pieces make one figure, plus the stencil one"
+    assert "the stairs, slowly" in text and not re.search(r">\s*[78]\b|\b[78]\s*<| [78] ", text), \
+        "page numbers dropped, so they don't get glued into the sentence"
+
+
+def test_picture_beside_text_and_page_ornament(tmp_path):
+    path, out = tmp_path / "side.pdf", tmp_path / "side.epub"
+    doc = pymupdf.open()
+    page = doc.new_page(width=400, height=600)
+    tile = pymupdf.Pixmap(pymupdf.csRGB, pymupdf.IRect(0, 0, 40, 40), False)
+    tile.set_rect(tile.irect, (230, 120, 160))
+    page.insert_textbox(pymupdf.Rect(50, 100, 250, 140), "It was a bright cold day in April, and the", fontsize=11)
+    page.insert_image(pymupdf.Rect(260, 120, 360, 220), pixmap=tile)  # beside the text, starting mid-paragraph
+    page.insert_textbox(pymupdf.Rect(50, 140, 250, 200), "clocks were striking thirteen.", fontsize=11)
+    page.insert_image(pymupdf.Rect(180, 545, 220, 585), pixmap=tile)  # page-number heart at the bottom
+    page.insert_text((197, 570), "1", fontsize=10)
+    doc.save(path)
+    epub.convert(str(path), str(out))
+    text = read(out)[1]
+    assert "and the clocks were striking thirteen.</p>\n<figure>" in text, "one paragraph, picture after it"
+    assert text.count("<img") == 1, "the ornament is dropped"
