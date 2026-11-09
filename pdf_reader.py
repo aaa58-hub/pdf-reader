@@ -119,7 +119,8 @@ class Viewer(QMainWindow):
                       ("&Export", None, [
                           ("&EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
                           ("EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
-                          ("&Word document (.docx)…", "Ctrl+Shift+D", self.export_word)]),
+                          ("&Word document (page layout)…", "Ctrl+Shift+D", lambda: self.export_word("layout")),
+                          ("Word document (&reflowable text)…", "", lambda: self.export_word("flow"))]),
                       ("&Quit", QKeySequence.Quit, self.close)],
             "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
                       ("Find &Next", QKeySequence.FindNext, self.find_next),
@@ -192,9 +193,9 @@ class Viewer(QMainWindow):
         self.export("EPUB", ".epub", "EPUB books (*.epub)",
                     lambda target, progress: epub.convert(self.path, target, mode, progress, self.password))
 
-    def export_word(self):
+    def export_word(self, mode):
         self.export("Word", ".docx", "Word documents (*.docx)",
-                    lambda target, progress: word.convert(self.path, target, progress, self.password))
+                    lambda target, progress: word.convert(self.path, target, mode, progress, self.password))
 
     def export(self, name, suffix, file_filter, convert):
         """Ask where to save, then run convert(target, progress) behind a cancellable progress dialog."""

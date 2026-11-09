@@ -119,12 +119,13 @@ def _render_chunk(pdf_path, password, indices):  # runs in a worker process
     return {i: page_jpeg(doc[i]) for i in indices}
 
 
-def render_pages(pdf_path, password, indices, progress, done, total):
-    """{index: JPEG} for the given pages, drawn on every CPU core: a scanned page costs ~0.3s each."""
+def render_pages(pdf_path, password, indices, progress, done, total, work=_render_chunk):
+    """{index: JPEG} for the given pages, drawn on every CPU core: a scanned page costs ~0.3s each.
+    work(pdf_path, password, indices) -> {index: result} can do more than draw (the Word layout does)."""
     pages = {}
     chunks = [indices[k:k + 2] for k in range(0, len(indices), 2)]  # small chunks: progress bar stays live
     with ProcessPoolExecutor() as pool:
-        futures = [pool.submit(_render_chunk, pdf_path, password, chunk) for chunk in chunks]
+        futures = [pool.submit(work, pdf_path, password, chunk) for chunk in chunks]
         for future in as_completed(futures):
             pages.update(future.result())
             if not progress(done + len(pages), total):
