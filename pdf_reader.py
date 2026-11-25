@@ -5,12 +5,14 @@ from pathlib import Path
 import pymupdf
 
 import epub
+import images
 import word
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
 from PySide6.QtWidgets import (
-    QApplication, QFileDialog, QInputDialog, QLabel, QLineEdit, QListWidget, QListWidgetItem,
-    QMainWindow, QMenu, QMessageBox, QProgressDialog, QScrollArea, QSplitter, QToolBar, QWidget,
+    QApplication, QDialog, QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMessageBox, QProgressDialog, QScrollArea,
+    QSpinBox, QSplitter, QToolBar, QWidget,
 )
 
 ZOOM_STEP, ZOOM_MIN, ZOOM_MAX = 1.25, 0.25, 5.0
@@ -50,6 +52,50 @@ def selected_lines(words, a, b):
         key, r = (w[5], w[6]), pymupdf.Rect(w[:4])  # (block, line)
         lines[key] = lines[key] | r if key in lines else r
     return list(lines.values())
+
+
+class PageImagesDialog(QDialog):
+    """Which pages, at what resolution. The file name and PNG/JPEG come from the save dialog after it."""
+
+    def __init__(self, parent, count):
+        super().__init__(parent)
+        self.setWindowTitle("Export pages as images")
+        self.first, self.last, self.dpi = QSpinBox(), QSpinBox(), QSpinBox()
+        for box in (self.first, self.last):
+            box.setRange(1, count)
+        self.last.setValue(count)
+        # no syncing the two boxes while typing: "12" passes through "1" on its way and would drag the other
+        # box along; a range typed backwards is simply read the right way round (pages())
+        self.dpi.setRange(72, 600)
+        self.dpi.setValue(150)
+        self.dpi.setSuffix(" dpi")
+        self.files = QLabel()
+        self.files.setWordWrap(True)
+        for box in (self.first, self.last):
+            box.valueChanged.connect(self.count_files)
+        self.count_files()
+        pages = QHBoxLayout()
+        for widget in (self.first, QLabel("to"), self.last):
+            pages.addWidget(widget)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        form = QFormLayout(self)
+        form.addRow("Pages:", pages)
+        form.addRow("", self.files)
+        form.addRow("Resolution:", self.dpi)
+        form.addRow("", QLabel("150 dpi for screens, 300 dpi for printing"))
+        form.addRow(buttons)
+
+    def pages(self):
+        """(first, last), 1-based, whichever way round they were typed."""
+        return tuple(sorted((self.first.value(), self.last.value())))
+
+    def count_files(self):
+        first, last = self.pages()
+        n = last - first + 1
+        self.files.setText("1 image file" if n == 1 else
+                           f"{n} image files: each page is saved as its own file, numbered by page")
 
 
 class Viewer(QMainWindow):
@@ -120,7 +166,8 @@ class Viewer(QMainWindow):
                           ("&EPUB (reflowable text)…", "Ctrl+E", lambda: self.export_epub("reflow")),
                           ("EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
                           ("&Word document (page layout)…", "Ctrl+Shift+D", lambda: self.export_word("layout")),
-                          ("Word document (&reflowable text)…", "", lambda: self.export_word("flow"))]),
+                          ("Word document (&reflowable text)…", "", lambda: self.export_word("flow")),
+                          ("Pages as &images…", "Ctrl+Shift+I", self.export_images)]),
                       ("&Quit", QKeySequence.Quit, self.close)],
             "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
                       ("Find &Next", QKeySequence.FindNext, self.find_next),
@@ -197,8 +244,20 @@ class Viewer(QMainWindow):
         self.export("Word", ".docx", "Word documents (*.docx)",
                     lambda target, progress: word.convert(self.path, target, mode, progress, self.password))
 
+    def export_images(self):
+        if not self.doc:
+            return
+        options = PageImagesDialog(self, len(self.doc))
+        if not options.exec():
+            return
+        (first, last), dpi = [n - 1 for n in options.pages()], options.dpi.value()
+        self.export("images", ".png", "PNG images (*.png);;JPEG images (*.jpg)",
+                    lambda target, progress: images.convert(self.path, target, first, last, dpi, progress,
+                                                            self.password))
+
     def export(self, name, suffix, file_filter, convert):
-        """Ask where to save, then run convert(target, progress) behind a cancellable progress dialog."""
+        """Ask where to save, then run convert(target, progress) behind a cancellable progress dialog.
+        convert may return what to report as saved (when that isn't simply the target)."""
         if not self.doc:
             return
         default = str(Path(self.path).with_suffix(suffix))
@@ -217,7 +276,7 @@ class Viewer(QMainWindow):
             return not dialog.wasCanceled()
 
         try:
-            convert(target, progress)
+            saved = convert(target, progress) or target
         except epub.Cancelled:
             return
         except Exception as e:
@@ -225,7 +284,7 @@ class Viewer(QMainWindow):
             return
         finally:
             dialog.close()
-        self.statusBar().showMessage(f"Saved {target}", 10000)
+        self.statusBar().showMessage(f"Saved {saved}", 10000)
 
     def save(self):
         """Append the changes to the open file: fast, and the original bytes stay intact underneath."""
