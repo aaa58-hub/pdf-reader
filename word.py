@@ -99,7 +99,7 @@ def layout_page(page, display):
             for s in spans:
                 page.add_redact_annot(s["bbox"])
         page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE)
-    pix = page.get_pixmap(matrix=pymupdf.Matrix(*[epub.PAGE_IMAGE_HEIGHT / page.rect.height] * 2), alpha=False)
+    pix = epub.draw(page, matrix=pymupdf.Matrix(*[epub.PAGE_IMAGE_HEIGHT / page.rect.height] * 2))
     picture = epub.jpeg(pix) if pix.samples.strip(b"\xff") else None  # an all-text page needs no picture
     text = " ".join("".join(s["text"] for s in spans) for lines in blocks for spans in lines)
     return ([frames(lines, page.rect.width) for lines in blocks], picture, page.rect.width, page.rect.height,
