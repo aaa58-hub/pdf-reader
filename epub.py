@@ -78,11 +78,20 @@ def jpeg(pix):
     return pix.tobytes("jpeg", jpg_quality=70)
 
 
+def draw(page, **options):
+    """page.get_pixmap(**options) without note icons: in a picture a note can't be clicked open, its icon
+    only hides the text under it. Highlights stay. Every export opens its own copy of the file, never
+    saved, so removing the notes here leaves the user's PDF alone."""
+    for xref in [a.xref for a in page.annots(types=[pymupdf.PDF_ANNOT_TEXT])]:
+        page.delete_annot(page.load_annot(xref))
+    return page.get_pixmap(alpha=False, **options)
+
+
 def figure_jpeg(page, rect):
     """The figure as it looks on the page: drawn, not extracted, so CMYK, transparency, stencil masks
     and pictures made of many pieces all come out right."""
     zoom = min(FIGURE_ZOOM, PAGE_IMAGE_HEIGHT / max(rect.width, rect.height))
-    return jpeg(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=rect, alpha=False))
+    return jpeg(draw(page, matrix=pymupdf.Matrix(zoom, zoom), clip=rect))
 
 
 def merge_touching(rects):
@@ -104,7 +113,7 @@ def merge_touching(rects):
 
 def page_jpeg(page):
     zoom = PAGE_IMAGE_HEIGHT / page.rect.height
-    return jpeg(page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False))
+    return jpeg(draw(page, matrix=pymupdf.Matrix(zoom, zoom)))
 
 
 def open_pdf(path, password):
