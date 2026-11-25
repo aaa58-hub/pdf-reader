@@ -5,7 +5,7 @@ from PySide6.QtWidgets import QDialog
 
 import epub
 import images
-from pdf_reader import PageImagesDialog, Viewer
+from pdf_reader import PagesDialog, Viewer
 from test_epub import book  # noqa: F401  (the 4-page novel fixture: 420 x 640 pt pages)
 
 
@@ -40,7 +40,7 @@ def test_cancel_leaves_no_half_written_file(book, out):
 
 
 def test_dialog_keeps_the_range_the_right_way_round(qtbot):
-    dialog = PageImagesDialog(None, 10)
+    dialog = PagesDialog(None, 10, "Export pages as images", resolution=True)
     qtbot.addWidget(dialog)
     assert (dialog.first.value(), dialog.last.value(), dialog.dpi.value()) == (1, 10, 150), "all pages, screen dpi"
     dialog.last.setValue(4)
@@ -60,7 +60,7 @@ def test_export_images_menu(qtbot, book, out, monkeypatch):
         dialog.dpi.setValue(72)
         return QDialog.Accepted
 
-    monkeypatch.setattr(PageImagesDialog, "exec", choose_pages_3_to_4)
+    monkeypatch.setattr(PagesDialog, "exec", choose_pages_3_to_4)
     monkeypatch.setattr("pdf_reader.QFileDialog.getSaveFileName", lambda *a: (str(out / "page.png"), ""))
     [action] = [a for a in viewer.findChildren(QAction) if a.text() == "Pages as &images…"]
     action.trigger()
