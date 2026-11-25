@@ -5,6 +5,7 @@ from pathlib import Path
 import pymupdf
 
 import epub
+import extract
 import images
 import word
 from PySide6.QtCore import QEvent, QRectF, QSize, Qt, QTimer
@@ -54,12 +55,12 @@ def selected_lines(words, a, b):
     return list(lines.values())
 
 
-class PageImagesDialog(QDialog):
-    """Which pages, at what resolution. The file name and PNG/JPEG come from the save dialog after it."""
+class PagesDialog(QDialog):
+    """Which pages (and, for images, at what resolution). The file name comes from the save dialog after it."""
 
-    def __init__(self, parent, count):
+    def __init__(self, parent, count, title, resolution=False):
         super().__init__(parent)
-        self.setWindowTitle("Export pages as images")
+        self.setWindowTitle(title)
         self.first, self.last, self.dpi = QSpinBox(), QSpinBox(), QSpinBox()
         for box in (self.first, self.last):
             box.setRange(1, count)
@@ -82,9 +83,10 @@ class PageImagesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form = QFormLayout(self)
         form.addRow("Pages:", pages)
-        form.addRow("", self.files)
-        form.addRow("Resolution:", self.dpi)
-        form.addRow("", QLabel("150 dpi for screens, 300 dpi for printing"))
+        if resolution:  # images
+            form.addRow("", self.files)
+            form.addRow("Resolution:", self.dpi)
+            form.addRow("", QLabel("150 dpi for screens, 300 dpi for printing"))
         form.addRow(buttons)
 
     def pages(self):
@@ -167,7 +169,8 @@ class Viewer(QMainWindow):
                           ("EPUB (&page images)…", "Ctrl+Shift+E", lambda: self.export_epub("fixed")),
                           ("&Word document (page layout)…", "Ctrl+Shift+D", lambda: self.export_word("layout")),
                           ("Word document (&reflowable text)…", "", lambda: self.export_word("flow")),
-                          ("Pages as &images…", "Ctrl+Shift+I", self.export_images)]),
+                          ("Pages as &images…", "Ctrl+Shift+I", self.export_images),
+                          ("Pages as a new P&DF…", "Ctrl+Shift+P", self.export_pages)]),
                       ("&Quit", QKeySequence.Quit, self.close)],
             "&Edit": [("&Find\u2026", QKeySequence.Find, self.open_find),
                       ("Find &Next", QKeySequence.FindNext, self.find_next),
@@ -247,7 +250,7 @@ class Viewer(QMainWindow):
     def export_images(self):
         if not self.doc:
             return
-        options = PageImagesDialog(self, len(self.doc))
+        options = PagesDialog(self, len(self.doc), "Export pages as images", resolution=True)
         if not options.exec():
             return
         (first, last), dpi = [n - 1 for n in options.pages()], options.dpi.value()
@@ -255,12 +258,26 @@ class Viewer(QMainWindow):
                     lambda target, progress: images.convert(self.path, target, first, last, dpi, progress,
                                                             self.password))
 
-    def export(self, name, suffix, file_filter, convert):
+    def export_pages(self):
+        if not self.doc:
+            return
+        options = PagesDialog(self, len(self.doc), "Save pages as a new PDF")
+        if not options.exec():
+            return
+        first, last = options.pages()
+        name = f"{Path(self.path).stem} (page {first})" if first == last else \
+            f"{Path(self.path).stem} (pages {first}-{last})"
+        self.export("PDF", ".pdf", "PDF files (*.pdf)",
+                    lambda target, progress: extract.convert(self.path, target, first - 1, last - 1, progress,
+                                                             self.password),
+                    default=str(Path(self.path).with_name(name + ".pdf")))
+
+    def export(self, name, suffix, file_filter, convert, default=None):
         """Ask where to save, then run convert(target, progress) behind a cancellable progress dialog.
         convert may return what to report as saved (when that isn't simply the target)."""
         if not self.doc:
             return
-        default = str(Path(self.path).with_suffix(suffix))
+        default = default or str(Path(self.path).with_suffix(suffix))
         target, _ = QFileDialog.getSaveFileName(self, f"Export as {name}", default, file_filter)
         if not target:
             return
