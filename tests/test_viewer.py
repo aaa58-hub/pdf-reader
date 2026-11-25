@@ -200,7 +200,9 @@ def test_matches_are_highlighted(viewer, pdf, qtbot):
     find(viewer, qtbot, "Page 1")
     qtbot.waitUntil(lambda: 0 in rendered(viewer))
     r = viewer.matches[0][1]
-    pixel = viewer.labels[0].pixmap().toImage().pixelColor(int(r.x0 + 2), int(r.y0 + 2))
+    pm = viewer.labels[0].pixmap()
+    dpr = pm.devicePixelRatio()  # the pixmap has more pixels than points on a 125%/150% scaled screen
+    pixel = pm.toImage().pixelColor(int((r.x0 + 2) * dpr), int((r.y0 + 2) * dpr))
     assert pixel.blue() < 200 < pixel.red(), "current match tinted orange"
 
 

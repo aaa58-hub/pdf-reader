@@ -39,15 +39,39 @@ def test_cancel_leaves_no_half_written_file(book, out):
     assert not list(out.glob("*.part"))
 
 
-def test_dialog_keeps_the_range_the_right_way_round(qtbot):
-    dialog = PagesDialog(None, 10, "Export pages as images", resolution=True)
+def test_typing_the_last_page_leaves_the_first_alone(qtbot):
+    dialog = PagesDialog(None, 40, "Export pages as images", resolution=True)
     qtbot.addWidget(dialog)
-    assert (dialog.first.value(), dialog.last.value(), dialog.dpi.value()) == (1, 10, 150), "all pages, screen dpi"
-    dialog.last.setValue(4)
-    dialog.first.setValue(7)
-    assert dialog.last.value() == 7
-    dialog.last.setValue(2)
-    assert dialog.first.value() == 2
+    assert (dialog.pages(), dialog.dpi.value()) == ((1, 40), 150), "all pages, screen dpi"
+    dialog.first.setValue(5)
+    dialog.last.lineEdit().selectAll()
+    qtbot.keyClicks(dialog.last, "12")  # passes through "1" on the way
+    assert dialog.pages() == (5, 12)
+    dialog.last.setValue(3)
+    assert dialog.pages() == (3, 5), "a range typed backwards is read the right way round"
+
+
+def test_dialog_says_each_page_is_its_own_file(qtbot):
+    dialog = PagesDialog(None, 40, "Export pages as images", resolution=True)
+    qtbot.addWidget(dialog)
+    dialog.last.setValue(20)
+    assert dialog.files.text().startswith("20 image files: each page is saved as its own file")
+    dialog.first.setValue(20)
+    assert dialog.files.text() == "1 image file"
+
+
+def test_highlights_stay_note_icons_go(tmp_path, out):
+    pdf = tmp_path / "notes.pdf"
+    doc = pymupdf.open()
+    page = doc.new_page(width=300, height=200)
+    page.insert_text((20, 50), "Highlighted words", fontsize=14)
+    page.add_highlight_annot(page.search_for("Highlighted"))
+    page.add_text_annot((200, 100), "A note")
+    doc.save(pdf)
+    images.convert(str(pdf), str(out / "page.png"), 0, 0, 72)
+    pix = pymupdf.Pixmap(str(out / "page.png"))
+    assert pix.pixel(25, 47)[2] < 150, "highlight painted (yellow: little blue)"
+    assert all(pix.pixel(x, y) == (255, 255, 255) for x in range(200, 216) for y in range(100, 116)), "no note icon"
 
 
 def test_export_images_menu(qtbot, book, out, monkeypatch):
