@@ -1,6 +1,8 @@
-"""PDF pages -> PNG or JPEG files, one per page, as they look on screen (annotations included)."""
+"""PDF pages -> PNG or JPEG files, one per page, as they look on screen (highlights included, note icons not)."""
 import functools
 from pathlib import Path
+
+import pymupdf
 
 import epub
 
@@ -26,7 +28,12 @@ def convert(pdf_path, target, first, last, dpi, progress=lambda done, total: Tru
 def _save_chunk(pdf_path, password, indices, paths, dpi):  # runs in a worker process
     doc = epub.open_pdf(pdf_path, password)
     for i in indices:
-        pix = doc[i].get_pixmap(dpi=dpi, alpha=False)
+        page = doc[i]
+        # a note's icon can't be clicked open in a picture: it would only hide the text under it.
+        # Our own copy of the file, never saved: highlights stay, notes go.
+        for xref in [a.xref for a in page.annots(types=[pymupdf.PDF_ANNOT_TEXT])]:
+            page.delete_annot(page.load_annot(xref))
+        pix = page.get_pixmap(dpi=dpi, alpha=False)
         output = FORMATS[Path(paths[i]).suffix.lower()]
         epub.write_atomically(paths[i], lambda tmp: pix.save(tmp, output=output, jpg_quality=90))
     return {i: paths[i] for i in indices}

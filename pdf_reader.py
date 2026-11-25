@@ -64,12 +64,16 @@ class PageImagesDialog(QDialog):
         for box in (self.first, self.last):
             box.setRange(1, count)
         self.last.setValue(count)
-        # keep the range the right way round
-        self.first.valueChanged.connect(lambda v: self.last.setValue(max(v, self.last.value())))
-        self.last.valueChanged.connect(lambda v: self.first.setValue(min(v, self.first.value())))
+        # no syncing the two boxes while typing: "12" passes through "1" on its way and would drag the other
+        # box along; a range typed backwards is simply read the right way round (pages())
         self.dpi.setRange(72, 600)
         self.dpi.setValue(150)
         self.dpi.setSuffix(" dpi")
+        self.files = QLabel()
+        self.files.setWordWrap(True)
+        for box in (self.first, self.last):
+            box.valueChanged.connect(self.count_files)
+        self.count_files()
         pages = QHBoxLayout()
         for widget in (self.first, QLabel("to"), self.last):
             pages.addWidget(widget)
@@ -78,9 +82,20 @@ class PageImagesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form = QFormLayout(self)
         form.addRow("Pages:", pages)
+        form.addRow("", self.files)
         form.addRow("Resolution:", self.dpi)
         form.addRow("", QLabel("150 dpi for screens, 300 dpi for printing"))
         form.addRow(buttons)
+
+    def pages(self):
+        """(first, last), 1-based, whichever way round they were typed."""
+        return tuple(sorted((self.first.value(), self.last.value())))
+
+    def count_files(self):
+        first, last = self.pages()
+        n = last - first + 1
+        self.files.setText("1 image file" if n == 1 else
+                           f"{n} image files: each page is saved as its own file, numbered by page")
 
 
 class Viewer(QMainWindow):
@@ -235,7 +250,7 @@ class Viewer(QMainWindow):
         options = PageImagesDialog(self, len(self.doc))
         if not options.exec():
             return
-        first, last, dpi = options.first.value() - 1, options.last.value() - 1, options.dpi.value()
+        (first, last), dpi = [n - 1 for n in options.pages()], options.dpi.value()
         self.export("images", ".png", "PNG images (*.png);;JPEG images (*.jpg)",
                     lambda target, progress: images.convert(self.path, target, first, last, dpi, progress,
                                                             self.password))
